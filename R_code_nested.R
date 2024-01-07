@@ -1,0 +1,823 @@
+ZU <- DT_DFLT %>%
+  filter(sekcija0 == "Žemės ūkis")
+
+# variable selection I: select only variables with >80% default cases ----------
+na_stats <- lapply(X = 1:ncol(ZU), FUN = function(X) {
+  data.frame(table(is.na(ZU[, X]), ZU$DEFAULT_100_3M_1Y)) %>%
+    group_by(Var2) %>%
+    mutate(proc = Freq / sum(Freq)) %>%
+    ungroup() %>%
+    mutate(var_name = colnames(ZU)[X])
+})
+na_stats <- do.call(rbind, na_stats)
+
+vars_to_keep <- na_stats %>%
+  filter(Var1 == FALSE) %>%
+  filter(Var2 == "1") %>%
+  filter(proc > 0.8) %>%
+  dplyr::select(var_name) %>%
+  unlist() %>%
+  unname()
+
+ZU <- ZU[, colnames(ZU)[colnames(ZU) %in% vars_to_keep]]
+
+# fix outliers -----------------------------------------------------------------
+for(i in 1:ncol(ZU)) {print(paste0(i, " ", colnames(ZU)[i]))}
+cols_to_fix <- c(8:35, 38:41, 55:59, 62:63, 66:71, 73:94, 125)
+
+out_stats <- lapply(X = 1:ncol(ZU), FUN = function(X){
+  
+  x <- ZU[, X]
+  if (!(X %in% cols_to_fix)) {
+    return(x)
+  }
+  
+  x_name <- names(x)
+  x <- unname(unlist(x))
+  if (is.numeric(x)){
+    lwr <- quantile(x, 0.01, na.rm = TRUE)
+    upr <- quantile(x, 0.99, na.rm = TRUE)
+    bound <- (upr - lwr) / 2
+    
+    # change outliers with bound values
+    x[which(!is.na(x) & (x > upr + bound))] <- upr + bound
+    x[which(!is.na(x) & (x < lwr - bound))] <- lwr - bound
+    x <- data.frame(x)
+    names(x) <- x_name
+    
+    return(x)
+  } else {
+    
+    x <- data.frame(x)
+    names(x) <- x_name
+    return(x)
+  }
+})
+out_stats <- Reduce(cbind, out_stats)
+all(out_stats$DEFAULT_100_3M_1Y == ZU$DEFAULT_100_3M_1Y)
+
+prev <- unname(table(out_stats$DEFAULT_100_3M_1Y) / nrow(out_stats))[2]
+b_cor <- ((1-prev) / prev) * 0.2
+print(paste0("Population prevalence: ", prev))
+print(paste0("Log-odds correction ", b_cor))
+ZU <- na.omit(out_stats)
+
+# drop categorical variables with one category <5% obs -------------------------
+drop_vars <- c()
+for (i in 2:ncol(ZU)) {
+  if (!is.numeric(unlist(ZU[, i]))) {
+    tbl <- table(ZU[, i]) / nrow(ZU)
+    v <- ifelse(any(tbl < 0.05), colnames(ZU)[i], NA)
+    v <- ifelse(is.na(v) & dim(tbl) == 1, colnames(ZU)[i], v)
+    if (!is.na(v)) {
+      drop_vars <- c(drop_vars, v)
+      print(colnames(ZU)[i])
+      print(tbl)
+    }} else {
+      tbl <- table(ZU[, i]) / nrow(ZU)
+      v <- ifelse(dim(tbl) == 1, colnames(ZU)[i], NA)
+      if (!is.na(v)) {
+        drop_vars <- c(drop_vars, v)
+        print(colnames(ZU)[i])
+        print(tbl)
+      }}
+}
+ZU <- ZU[, !(names(ZU) %in% drop_vars)]
+
+######################### load variable groups and coef signs ------------------
+var_list <- openxlsx::read.xlsx("../choose_vars.xlsx")
+
+####### function for hard selection sign checking ------------------------------
+check_sign <- function(s){
+  for (i in 1:nrow(s)) {
+    #print(i)
+    if (s$var[i] %in% var_list$variable) {
+      s$var_group[i] <- var_list[var_list[, "variable"] == s$var[i], "var_group"]
+      s$group[i] <- var_list[var_list[, "variable"] == s$var[i], "group"]
+      s$sign_good[i] <- var_list[var_list[, "variable"] == s$var[i], "sign"] == sign(s$coef[i])
+    } else if (s$var[i] %in% var_list$cat_name) {
+      s$var_group[i] <- var_list[var_list[, "cat_name"] == s$var[i], "var_group"]
+      s$group[i] <- var_list[var_list[, "cat_name"] == s$var[i], "group"]
+      s$sign_good[i] <- var_list[var_list[, "cat_name"] == s$var[i], "sign"] == sign(s$coef[i])
+    } else {
+      s$group[i] <- var_list[var_list[, "variable"] == s$var_cat[i], "group"]
+      s$var_group[i] <- var_list[var_list[, "variable"] == s$var_cat[i], "var_group"]
+    }}
+  return(s)
+}
+
+####### function for variable-one hot mapping ----------------------------------
+map_onehot <- function(data) {
+  allvars <- data.frame(cat_name = NA, variable = NA)
+  for (i in 1:ncol(data)) {
+    #i <- 1
+    if (is.factor(data[, i])) {
+      ncat <- paste0(colnames(data)[i], unique(data[, i]))
+      temp <- data.frame(cat_name = ncat,
+                         variable = rep(colnames(data)[i], length(ncat)))
+    } else {
+      temp <- data.frame(cat_name = colnames(data)[i],
+                         variable = colnames(data)[i])
+    }
+    allvars <- rbind(allvars, temp)
+  }
+  allvars <- tail(allvars, -1)
+  return(allvars)
+}
+
+####### soft selection sign restrictions ---------------------------------------
+signs <- map_onehot(ZU)
+signs <- signs %>% filter(variable != "DEFAULT_100_3M_1Y")
+
+varcats <- var_list[, c("cat_name", "sign")] %>%
+  filter(!is.na(sign), cat_name != "-")
+signs <- signs %>%
+  left_join(., varcats, by = "cat_name")
+
+varcats <- var_list %>%
+  filter(!is.na(sign), cat_name == "-") %>%
+  select(variable, sign) %>%
+  rename(varsign = sign)
+signs <- signs %>%
+  left_join(., varcats, by = "variable")
+
+signs$sign <- ifelse(is.na(signs$sign), signs$varsign, signs$sign)
+signs$varsign <- NULL
+
+signs$u <- ifelse(is.na(signs$sign), Inf,
+                  ifelse(signs$sign == -1, 0, Inf))
+signs$l <- ifelse(is.na(signs$sign), -Inf,
+                  ifelse(signs$sign == 1, 0, -Inf))
+
+rm(varcats)
+gc()
+
+####### FUNCTION FOR LOGIT -----------------------------------------------------
+col_logit <- function(xvar, data){
+  #xvar <- xvars[1]
+  train <- data[, c("DEFAULT_100_3M_1Y", xvar)]
+  mdl <- glm(DEFAULT_100_3M_1Y ~ ., data = train,
+             family = binomial(link = "logit"))
+  #summary(mdl)
+  train$probs <- predict(mdl, train, type = "response")
+  # collect results
+  sig <- min(coef(summary(mdl))[2:nrow(coef(summary(mdl))), 4])
+  coef_summ <- coef(summary(mdl))
+  imp <- mean(varImp(mdl)[, 1])
+  IV <- unname(unlist(scorecard::iv(train, "DEFAULT_100_3M_1Y", positive = "1")[1, 2]))
+  auroc <- AUC(train$probs, train$DEFAULT_100_3M_1Y)
+  aucpr <- PRAUC(train$probs, train$DEFAULT_100_3M_1Y)
+  #aucpr_re <- rescale(aucpr, to = c(0.5, 1), from = c(prev, 1))
+  tt <- tryCatch(t.test(train[train[, "DEFAULT_100_3M_1Y"] == 0, "probs"],
+                        train[train[, "DEFAULT_100_3M_1Y"] == 1, "probs"]),
+                 error = function(err){data.frame(p.value = NA)})
+  tt <- tt$p.value
+  #ks <- KS_Stat(test$probs, test$DEFAULT_100_3M_1Y)
+  
+  # return results as list -----
+  rez <- list(specs = c(sig, imp, IV, auroc, aucpr, tt),
+              beta = coef_summ,
+              model = mdl)
+  names(rez$specs) <- c("sig", "varimp", "infoval", "auroc", "aucpr", "t_sig")
+  
+  return(rez)
+}
+
+####### FUNCTION FOR RELEVANT CORRELATIONS -------------------------------------
+get_cors <- function(var, corr_matrix, category_names) {
+  #var <- r2$var[1]
+  r1c <- category_names[category_names$variable == var, "cat_name"]
+  r1c <- colnames(corr_matrix)[colnames(corr_matrix) %in% r1c]
+  r1_cr <- as.data.frame(corr_matrix[, r1c])
+  colnames(r1_cr) <- paste0("V", 1:length(r1c))
+  # max in case of categorical
+  if (ncol(r1_cr) > 1) {
+    r1_cr <- data.frame(V1 = apply(r1_cr, 1, FUN = function(r){return(max(abs(r)))}))
+  }
+  r1_cr$cat_name <- rownames(corr_matrix)
+  r1_cr <- r1_cr %>%
+    left_join(., category_names, by = "cat_name") %>%
+    group_by(variable) %>%
+    summarise(V1 = max(abs(V1)))
+  
+  colnames(r1_cr) <- c("variable", var)
+  return(r1_cr)
+}
+
+## -----------------------------------------------------------------------------
+## ------------------ START OF CASE CONTROL CROSS VALIDATION -------------------
+# shuffle data -----
+set.seed(00000)
+row_ids <- sample(1:nrow(ZU), size = nrow(ZU), replace = FALSE)
+ZU <- ZU[row_ids, ]
+
+# split dataset for outer CV -----
+require(caret)
+set.seed(12345)
+fldsx <- createFolds(ZU$DEFAULT_100_3M_1Y, k = 10, list = TRUE)
+fldsx <- lapply(X = fldsx, FUN = function(X){return(ZU[X, ])})
+
+######################### iterate over outer folds -----------------------------
+require(MLmetrics)
+require(glmnet)
+require(rpart)
+require(rpart.plot)
+
+res <- lapply(X = 1:length(fldsx),
+              FUN = function(X, outer_folds = fldsx, lasso_signs = signs){
+                
+                print(paste0("Beginning outer fold ", X, " ################################################"))
+                gc()
+                Sys.sleep(15)
+                # keep X fold for validation, join other folds for training -----
+                dt_val <- outer_folds[[X]]
+                dt <- outer_folds
+                dt[[X]] <- NULL
+                dt <- Reduce(rbind, dt)
+                
+                ########### inner cross validation -------------------------------------------
+                # split into 5 folds -----
+                set.seed(123)
+                fldsi <- createFolds(dt$DEFAULT_100_3M_1Y, k = 5, list = TRUE)
+                fldsi <- lapply(X = fldsi, FUN = function(X){return(dt[X, ])})
+                
+                # get grid of lambda for lasso and grid of cp for rpart -----
+                dt_soft <- dt
+                n0 <- sum(dt_soft$DEFAULT_100_3M_1Y == "1")*5
+                N0 <- sum(dt_soft$DEFAULT_100_3M_1Y == "0")
+                sample0 <- sample(1:N0, size = n0, replace = FALSE)
+                dt0_soft <- dt_soft[dt_soft[, "DEFAULT_100_3M_1Y"] == "0", ]
+                dt_soft <- dt_soft[dt_soft[, "DEFAULT_100_3M_1Y"] == "1", ]
+                dt0_soft <- dt0_soft[sample0, ]
+                dt_soft <- rbind(dt_soft, dt0_soft)
+                dt_soft <- dt_soft[sample(1:nrow(dt_soft), size = nrow(dt_soft), replace = FALSE), ]
+                
+                # cp grid -----
+                tree_control = c(minsplit = 2, minbucket = 1, cp = 0, xval = 0)
+                set.seed(12345)
+                mdl_tree <- rpart(DEFAULT_100_3M_1Y ~., data = dt_soft, method = "class",
+                                  control = tree_control)
+                middle <- head(mdl_tree$cptable[, 1], 1)/2
+                cp_grid <- c(seq(head(mdl_tree$cptable[, 1], 1), middle, length.out = 50),
+                             seq(middle, tail(mdl_tree$cptable[, 1], 1), length.out = 151))
+                cp_grid <- unique(cp_grid)
+                
+                # lambda grid -----
+                dt_soft$DEFAULT_100_3M_1Y <- factor(dt_soft$DEFAULT_100_3M_1Y,
+                                                    levels = c(0, 1), labels = c("no", "yes"))
+                dt_y <- dt_soft$DEFAULT_100_3M_1Y
+                dt_x <- model.matrix(DEFAULT_100_3M_1Y ~ ., dt_soft)
+                dt_x <- dt_x[, colnames(dt_x) != "(Intercept)"]
+                
+                vu <- lasso_signs[lasso_signs$cat_name %in% colnames(dt_x), "u"]
+                vl <- lasso_signs[lasso_signs$cat_name %in% colnames(dt_x), "l"]
+                
+                mdl_soft <- glmnet(x = dt_x, y = dt_y, alpha = 1, family = "binomial",
+                                   lower.limits = vl, upper.limits = vu)
+                
+                lambda_grid <- mdl_soft$lambda
+                rm(dt_soft, dt0_soft, mdl_soft, tree_control, mdl_tree, dt_x, dt_y)
+                gc()
+                Sys.sleep(5)
+                
+                ########### iterate over inner folds -----------------------------------------
+                resi <- lapply(1:length(fldsi),
+                               FUN = function(Y, inner_folds = fldsi, signsi = lasso_signs,
+                                              lambda_gr = lambda_grid, cp_gr = cp_grid){
+                                 
+                                 print(paste0("Beginning inner fold ", Y, " ################################################"))
+                                 # keep Y fold for validation, join other folds for training -----
+                                 dt_vali <- inner_folds[[Y]]
+                                 dti <- inner_folds
+                                 dti[[Y]] <- NULL
+                                 dti <- Reduce(rbind, dti)
+                                 
+                                 ########### case-control 1:5 -----
+                                 # determine number of 0 to keep
+                                 n0 <- sum(dti$DEFAULT_100_3M_1Y == "1")*5
+                                 N0 <- sum(dti$DEFAULT_100_3M_1Y == "0")
+                                 # randomly sample 0
+                                 set.seed(1234)
+                                 sample0 <- sample(1:N0, size = n0, replace = FALSE)
+                                 # join final dataset with 1:5 ratio
+                                 dt0 <- dti[dti[, "DEFAULT_100_3M_1Y"] == "0", ]
+                                 dti <- dti[dti[, "DEFAULT_100_3M_1Y"] == "1", ]
+                                 dt0 <- dt0[sample0, ]
+                                 dti <- rbind(dti, dt0)
+                                 #table(dti$DEFAULT_100_3M_1Y)
+                                 # reshuffle
+                                 dti <- dti[sample(1:nrow(dti), size = nrow(dti), replace = FALSE), ]
+                                 
+                                 ############################ SOFT variable selection -----------------------
+                                 print("SOFT model evaluation ---------------------------------------------")
+                                 dti_soft <- dti
+                                 dti_soft$DEFAULT_100_3M_1Y <- factor(dti_soft$DEFAULT_100_3M_1Y,
+                                                                      levels = c(0, 1), labels = c("no", "yes"))
+                                 dti_y <- dti_soft$DEFAULT_100_3M_1Y
+                                 dti_x <- model.matrix(DEFAULT_100_3M_1Y ~ ., dti_soft)
+                                 dti_x <- dti_x[, colnames(dti_x) != "(Intercept)"]
+                                 
+                                 vu <- signsi[signsi$cat_name %in% colnames(dti_x), "u"]
+                                 vl <- signsi[signsi$cat_name %in% colnames(dti_x), "l"]
+                                 
+                                 mdl_soft <- glmnet(x = dti_x, y = dti_y, alpha = 1, family = "binomial",
+                                                    lower.limits = vl, upper.limits = vu, lambda = lambda_gr)
+                                 
+                                 ############################ HARD variable selection -----------------------
+                                 # logit with one variable, select best by auroc and sign -----
+                                 print("HARD model evaluation ---------------------------------------------")
+                                 xvars <- colnames(dti)[colnames(dti) != "DEFAULT_100_3M_1Y"]
+                                 logit_compare <- lapply(xvars, FUN = col_logit, data = dti)
+                                 names(logit_compare) <- xvars
+                                 
+                                 # compare variable specs and signs -----
+                                 logit_compare0 <- lapply(logit_compare, FUN = function(x) x$specs)
+                                 logit_compare0 <- data.frame(Reduce(rbind, logit_compare0))
+                                 logit_compare0$var <- xvars
+                                 logit_compare0 <- as_tibble(logit_compare0)
+                                 
+                                 # check coef signs
+                                 logit_compare_signs <- lapply(1:length(logit_compare), FUN = function(x) {
+                                   #x <- 1
+                                   temp <- logit_compare[[x]]
+                                   cfs <- data.frame(temp$beta)
+                                   cfs$names <- rownames(cfs)
+                                   cfs <- cfs[2:nrow(cfs), c(1, 5)]
+                                   
+                                   s <- data.frame(var = cfs$names, var_cat = names(logit_compare)[x],
+                                                   coef = cfs$Estimate, group = NA, sign_good = NA, var_group = NA)
+                                   
+                                   s <- check_sign(s)
+                                   rownames(s) <- NULL
+                                   return(s)
+                                 })
+                                 logit_compare_signs <- Reduce(rbind, logit_compare_signs)
+                                 
+                                 logit_compare_signs0 <- as_tibble(logit_compare_signs) %>%
+                                   select(var_cat, group, var_group, sign_good) %>%
+                                   distinct() %>%
+                                   group_by(var_cat) %>%
+                                   mutate(n = n(), na = all(is.na(sign_good))) %>%
+                                   ungroup() %>%
+                                   mutate(id = ifelse(n == 1, 1,
+                                                      ifelse(!is.na(sign_good), 1,
+                                                             ifelse(na == TRUE, 1, 0)))) %>%
+                                   filter(id == 1) %>%
+                                   select(-id, -n, -na) %>%
+                                   distinct() %>%
+                                   group_by(var_cat) %>%
+                                   mutate(n = n()) %>%
+                                   filter(n == 1 | (n > 1 & sign_good == TRUE) | (n > 1 & sign_good == FALSE)) %>%
+                                   select(-n) %>%
+                                   distinct() %>%
+                                   rename(var = var_cat)
+                                 
+                                 ##### Variable selection II: best vars -----
+                                 # choose best by sign, sig, auc-pr, auroc, t-test sig
+                                 best_vars <- logit_compare0 %>%
+                                   left_join(., logit_compare_signs0, by = "var") %>%
+                                   filter(sig < 0.05) %>%
+                                   filter(is.na(sign_good) | sign_good == TRUE) %>%
+                                   filter(aucpr > prev) %>%
+                                   filter(auroc > 0.5) %>%
+                                   filter(!is.na(t_sig) & t_sig < 0.05) %>%
+                                   arrange(desc(aucpr)) %>%
+                                   mutate(rank = row_number())
+                                 
+                                 print(paste0("Number of variables after stage I: ", length(xvars)))
+                                 print(paste0("Number of variables after stage II: ", nrow(best_vars)))
+                                 
+                                 # calculate correlations -----
+                                 dti_cor <- model.matrix(~., dti[, best_vars$var])
+                                 dti_cor <- dti_cor[, colnames(dti_cor) != "(Intercept)"]
+                                 cormat <- as.data.frame(cor(dti_cor))
+                                 catnames <- map_onehot(dti[, best_vars$var])
+                                 
+                                 ##### Variable selection III -----
+                                 # add variables by rank and correlation
+                                 # correlations for best variable -----
+                                 r1 <- unname(unlist(best_vars[best_vars$rank == 1, "var"]))
+                                 r1_cor <- get_cors(r1, cormat, catnames)
+                                 # leave only uncorrelated
+                                 r1_cor <- r1_cor[abs(r1_cor[, r1]) < 0.25, ]
+                                 # new best var list
+                                 best_vars <- r1_cor$variable
+                                 
+                                 # first logit with best var -----
+                                 logit_final <- col_logit(xvar = r1, data = dti)
+                                 cfs <- data.frame(logit_final$beta)
+                                 cfs$names <- rownames(cfs)
+                                 cfs <- tail(cfs[, c(1, 4:5)], -1)
+                                 
+                                 vars_inc <- r1
+                                 aucpr_last <- logit_final$specs["aucpr"]
+                                 auroc_last <- logit_final$specs["auroc"]
+                                 nvars <- nrow(cfs)
+                                 
+                                 # all possible subsets of r1 and uncorrelated others ------
+                                 continue <- TRUE
+                                 Round <- 0
+                                 while (continue) {
+                                   Round <- Round + 1
+                                   #print(paste0("Round ", Round, ": ----------------------------------------------"))
+                                   r2 <- lapply(1:length(best_vars), FUN = function(r){
+                                     #r <- 1
+                                     #print(paste0(r, " ", best_vars[r]))
+                                     var <- c(vars_inc, best_vars[r])
+                                     logit_final <- col_logit(xvar = var, data = dti)
+                                     cfs <- data.frame(logit_final$beta)
+                                     cfs$names <- rownames(cfs)
+                                     cfs <- tail(cfs[, c(1, 4:5)], -1)
+                                     
+                                     nx <- c(nvars, nrow(cfs) -sum(nvars))
+                                     varsig <- split(cfs[, 2], rep(1:length(nx), nx))
+                                     varsig <- unlist(lapply(varsig, min))
+                                     varsig[is.infinite(varsig)] <- 1
+                                     varsig <- all(varsig < 0.05)
+                                     # check coef signs
+                                     s <- data.frame(var = cfs$names,
+                                                     var_cat = rep(var, times = nx),
+                                                     coef = cfs$Estimate,
+                                                     group = NA, sign_good = NA, var_group = NA)
+                                     s <- check_sign(s)
+                                     s <- all(s$sign_good == TRUE | is.na(s$sign_good))
+                                     aucpr <- logit_final$specs["aucpr"]
+                                     auroc <- logit_final$specs["auroc"]
+                                     tsig <- ifelse(is.na(logit_final$specs["t_sig"]), FALSE,
+                                                    logit_final$specs["t_sig"] < 0.05)
+                                     
+                                     temp <- data.frame(var = best_vars[r],
+                                                        varsig = varsig, sign = s,
+                                                        aucpr = aucpr, auroc = auroc, tsig = tsig)
+                                     rownames(temp) <- NULL
+                                     return(temp)
+                                   })
+                                   r2 <- Reduce(rbind, r2)
+                                   # keep only good vars and rank them -----
+                                   r2 <- r2 %>%
+                                     filter(varsig == TRUE) %>%
+                                     filter(sign == TRUE) %>%
+                                     filter(tsig == TRUE) %>%
+                                     arrange(desc(aucpr)) %>%
+                                     mutate(rank = row_number())
+                                   
+                                   if (nrow(r2) == 0) break
+                                   logit_final <- col_logit(c(vars_inc, r2$var[1]), data = dti)
+                                   cfs <- data.frame(logit_final$beta)
+                                   cfs <- tail(cfs, -1)
+                                   
+                                   id1 <- r2$aucpr[1] > aucpr_last
+                                   if (id1) {
+                                     vars_inc <- c(vars_inc, r2$var[1])
+                                     aucpr_last <- logit_final$specs["aucpr"]
+                                     auroc_last <- logit_final$specs["auroc"]
+                                     nvars <- c(nvars, nrow(cfs) -sum(nvars))
+                                     #print(logit_final)
+                                   }
+                                   #id1 <- r2$auroc[1] > auroc_last
+                                   # new correlation matrix
+                                   r1_cor <- get_cors(r2$var[1], cormat, catnames)
+                                   # leave only uncorrelated
+                                   r1_cor <- r1_cor[abs(r1_cor[, r2$var[1]]) < 0.25, ]
+                                   # new best var list
+                                   best_vars <- r1_cor$variable[r1_cor$variable %in% best_vars]
+                                   id2 <- length(best_vars) > 0
+                                   continue <- id1 & id2
+                                 }
+                                 # model after Y inner fold
+                                 logit_final <- col_logit(vars_inc, data = dti)
+                                 print(paste0("Number of variables after stage III: ",
+                                              ncol(logit_final$model$model)-1))
+                                 
+                                 ############################ CART variable selection -----------------------
+                                 print("CART model evaluation ---------------------------------------------")
+                                 tree_control = c(minsplit = 2, minbucket = 1, cp = 0, xval = 0)
+                                 set.seed(12345)
+                                 mdl_tree <- rpart(DEFAULT_100_3M_1Y ~., data = dti, method = "class",
+                                                   control = tree_control)
+                                 
+                                 ############################ SOFT validation -------------------------------
+                                 dt_vali_soft <- dt_vali
+                                 dt_vali_y <- dt_vali_soft$DEFAULT_100_3M_1Y
+                                 dt_vali_soft$DEFAULT_100_3M_1Y <- factor(dt_vali_soft$DEFAULT_100_3M_1Y,
+                                                                          levels = c(0, 1), labels = c("no", "yes"))
+                                 dt_vali_x <- model.matrix(DEFAULT_100_3M_1Y ~ ., dt_vali_soft)
+                                 dt_vali_x <- dt_vali_x[, !(colnames(dt_vali_x) %in% c("(Intercept)", "DEFAULT_100_3M_1Y"))]
+                                 probs_soft <- predict(mdl_soft, newx = dt_vali_x, type = "link")
+                                 probs_soft <- probs_soft - log(b_cor)
+                                 probs_soft <- exp(probs_soft) / (1+exp(probs_soft))
+                                 
+                                 auroc_soft <- apply(probs_soft, 2, AUC, y_true = dt_vali_y)
+                                 aucpr_soft <- apply(probs_soft, 2, PRAUC, y_true = dt_vali_y)
+                                 # tt_soft <- tryCatch(t.test(train[train[, "DEFAULT_100_3M_1Y"] == 0, "probs"],
+                                 #                       train[train[, "DEFAULT_100_3M_1Y"] == 1, "probs"]),
+                                 #                error = function(err){data.frame(p.value = NA)})
+                                 # tt <- tt$p.value
+                                 specs_soft <- data.frame(lambda = lambda_gr,
+                                                          aucpr = aucpr_soft,
+                                                          auroc = auroc_soft,
+                                                          fold = Y)
+                                 
+                                 resi_soft <- list(model = mdl_soft,
+                                                   predictions = probs_soft,
+                                                   specs = specs_soft)
+                                 
+                                 ############################ HARD validation -------------------------------
+                                 probs_hard <- predict(logit_final$model, dt_vali)
+                                 probs_hard <- probs_hard - log(b_cor)
+                                 probs_hard <- exp(probs_hard) / (1+exp(probs_hard))
+                                 # collect results
+                                 auroc_hard <- AUC(probs_hard, dt_vali$DEFAULT_100_3M_1Y)
+                                 aucpr_hard <- PRAUC(probs_hard, dt_vali$DEFAULT_100_3M_1Y)
+                                 # return results as list
+                                 resi_hard <- list(model = logit_final,
+                                                   predictions = probs_hard,
+                                                   auroc = auroc_hard,
+                                                   aucpr = aucpr_hard,
+                                                   fold = Y)
+                                 
+                                 ############################ CART validation -------------------------------
+                                 resi_cart <- lapply(1:length(cp_gr), FUN = function(i){
+                                   #i <- 89
+                                   #cp <- mdl_tree$cptable[i, 1]
+                                   cp <- cp_gr[i]
+                                   #nsplit <- mdl_tree$cptable[i, 2]
+                                   mdl_tree_pruned <- prune(mdl_tree, cp)
+                                   nsplit <- mdl_tree_pruned$cptable[nrow(mdl_tree_pruned$cptable), 2]
+                                   probs <- rpart.predict(mdl_tree_pruned, newdata = dt_vali, type = "prob")
+                                   probs <- probs[, 2]
+                                   
+                                   return(list(cp = cp, nsplit = nsplit, probs = probs))
+                                 })
+                                 
+                                 cp <- lapply(resi_cart, FUN = function(x){return(x$cp)})
+                                 cp <- Reduce(rbind, cp)
+                                 nsplit <- lapply(resi_cart, FUN = function(x){return(x$nsplit)})
+                                 nsplit <- Reduce(rbind, nsplit)
+                                 probs_cart <- lapply(resi_cart, FUN = function(x){return(x$probs)})
+                                 probs_cart <- Reduce(cbind, probs_cart)
+                                 
+                                 dt_vali_y <- dt_vali$DEFAULT_100_3M_1Y
+                                 auroc_cart <- apply(probs_cart, 2, AUC, y_true = dt_vali_y)
+                                 aucpr_cart <- apply(probs_cart, 2, PRAUC, y_true = dt_vali_y) 
+                                 
+                                 specs_cart <- data.frame(cp = cp, nsplit = nsplit,
+                                                          aucpr = aucpr_cart,
+                                                          auroc = auroc_cart,
+                                                          fold = Y)
+                                 
+                                 resi_cart <- list(model = mdl_tree,
+                                                   predictions = probs_cart,
+                                                   specs = specs_cart)
+                                 
+                                 ############################ Results ---------------------------------------
+                                 return(list(soft = resi_soft, hard = resi_hard, cart = resi_cart,
+                                             data = list(dti, dt_vali)))
+                               })
+                
+                ########### SET HYPERPARAMETERS and FIT OUTER MODELS -------------------------
+                ############################ SOFT lambda -------------------------------------
+                resi_soft <- lapply(resi, FUN = function(x){x$soft$specs$aucpr})
+                resi_soft <- Reduce(cbind, resi_soft)
+                resi_soft_sum <- apply(resi_soft, 1, FUN = function(x){
+                  mi <- min(x)
+                  ma <- max(x)
+                  mn <- mean(x)
+                  se <- sd(x) / sqrt(5)
+                  temp <- data.frame(min = mi, max = ma, aucpr = mn, se = se)
+                  return(temp)
+                })
+                resi_soft_sum <- Reduce(rbind, resi_soft_sum)
+                resi_soft_sum <- cbind(lambda_grid, resi_soft_sum)
+                # lambda max
+                lmax_n <- which.max(resi_soft_sum$aucpr)
+                lmax <- resi_soft_sum$lambda_grid[lmax_n]
+                # se of max lambda
+                se_lmax <- resi_soft_sum$se[lmax_n]
+                # aucpr of max lambda
+                auc_lmax <- resi_soft_sum$aucpr[lmax_n]
+                # lambda 1se
+                l1se <- max(resi_soft_sum$lambda_grid[resi_soft_sum$aucpr > auc_lmax - se_lmax])
+                l1se_n <- which(resi_soft_sum$lambda_grid == l1se)
+                # aucpr of 1se lambda
+                auc_l1se <- resi_soft_sum$aucpr[l1se_n]
+                
+                print("SOFT model hyperparameters -------------------------------------------")
+                print(paste0("log(lambda max): ", round(log(lmax), 4),
+                             " AUPRC: ", round(auc_lmax, 4)))
+                print(paste0("log(lambda 1se): ", round(log(l1se), 4),
+                             " AUPRC: ", round(auc_l1se, 4)))
+                
+                ############################ SOFT outer estimation ---------------------------
+                # fit model with lambda max and lambda 1se
+                print("SOFT model outer evaluation ------------------------------------------")
+                dt_soft <- dt
+                dt_y_true <- dt_soft$DEFAULT_100_3M_1Y
+                dt_soft$DEFAULT_100_3M_1Y <- factor(dt_soft$DEFAULT_100_3M_1Y,
+                                                    levels = c(0, 1), labels = c("no", "yes"))
+                dt_y <- dt_soft$DEFAULT_100_3M_1Y
+                dt_x <- model.matrix(DEFAULT_100_3M_1Y ~ ., dt_soft)
+                dt_x <- dt_x[, colnames(dt_x) != "(Intercept)"]
+                
+                vu <- lasso_signs[lasso_signs$cat_name %in% colnames(dt_x), "u"]
+                vl <- lasso_signs[lasso_signs$cat_name %in% colnames(dt_x), "l"]
+                
+                dl <- l1se-lmax
+                new_lambda <- seq(5*dl+l1se, max(lmax-5*dl, 0), length.out = 200)
+                mdl_softmax <- glmnet(x = dt_x, y = dt_y, alpha = 1, family = "binomial",
+                                      lower.limits = vl, upper.limits = vu, lambda = new_lambda)
+                
+                # in-sample performance
+                probs_soft_in <- predict(mdl_softmax, newx = dt_x, type = "response",
+                                         s = c(lmax, l1se), exact = FALSE)
+                
+                auroc_soft_in <- apply(probs_soft_in, 2, AUC, y_true = dt_y_true)
+                aucpr_soft_in <- apply(probs_soft_in, 2, PRAUC, y_true = dt_y_true)
+                
+                ############################ SOFT outer validation ---------------------------
+                # test model with lambda max and lambda 1se
+                print("SOFT model outer validation ------------------------------------------")
+                dt_val_soft <- dt_val
+                dt_val_y <- dt_val_soft$DEFAULT_100_3M_1Y
+                dt_val_soft$DEFAULT_100_3M_1Y <- factor(dt_val_soft$DEFAULT_100_3M_1Y,
+                                                        levels = c(0, 1), labels = c("no", "yes"))
+                dt_val_x <- model.matrix(DEFAULT_100_3M_1Y ~ ., dt_val_soft)
+                dt_val_x <- dt_val_x[, !(colnames(dt_val_x) %in% c("(Intercept)", "DEFAULT_100_3M_1Y"))]
+                probs_soft <- predict(mdl_softmax, newx = dt_val_x, type = "response",
+                                      s = c(lmax, l1se), exact = FALSE)
+                
+                auroc_soft <- apply(probs_soft, 2, AUC, y_true = dt_val_y)
+                aucpr_soft <- apply(probs_soft, 2, PRAUC, y_true = dt_val_y)
+                
+                print(paste0("lambda max AUPRC: ", round(aucpr_soft[1], 4)))
+                print(paste0("lambda 1se AUPRC: ", round(aucpr_soft[2], 4)))
+                
+                ############################ SOFT outer results ------------------------------
+                specs_soft <- data.frame(lambda = c(l1se, lmax),
+                                         inner_cv_aucpr = c(auc_l1se, auc_lmax),
+                                         in_sample_auroc = auroc_soft_in,
+                                         in_sample_aucpr = aucpr_soft_in,
+                                         outer_aucpr = aucpr_soft,
+                                         outer_auroc = auroc_soft,
+                                         fold = X)
+                
+                res_soft <- list(outer_model = mdl_softmax,
+                                 outer_predictions = probs_soft,
+                                 in_sample_predictions = probs_soft_in,
+                                 specs = specs_soft)
+                
+                ############################ HARD variable selection -------------------------
+                # fit model with chosen variables
+                print("HARD model outer evaluation ------------------------------------------")
+                resi_hard <- lapply(resi, FUN = function(x){x$hard$model})
+                resi_hard_sum <- lapply(resi, FUN = function(x){
+                  #x <- resi[[1]]
+                  y <- x$hard
+                  temp <- data.frame(c(y$auroc, y$aucpr))
+                  colnames(temp) <- paste0("Fold_", y$fold)
+                  return(temp)
+                })
+                resi_hard_sum <- Reduce(cbind, resi_hard_sum)
+                
+                # best model by aucpr
+                hard_bestn <- which.max(resi_hard_sum[2, ])
+                hard_best <- resi[[hard_bestn]]$hard$model$model
+                xvars_best <- colnames(hard_best$model)
+                hard_best <- col_logit(xvars_best[xvars_best != "DEFAULT_100_3M_1Y"], dt)
+                
+                # combination of variables that appear in 3/5 inner folds
+                xvarsi <- lapply(resi, FUN = function(x){
+                  #x <- resi[[1]]
+                  temp <- data.frame(vars = colnames(x$hard$model$model$model),
+                                     fold = x$hard$fold)
+                  return(temp)
+                })
+                xvarsi <- Reduce(rbind, xvarsi)
+                xvarsi <- xvarsi %>%
+                  filter(vars != "DEFAULT_100_3M_1Y") %>%
+                  group_by(vars) %>%
+                  summarise(n = n()) %>%
+                  filter(n >= 3) %>%
+                  select(vars) %>%
+                  unlist() %>%
+                  unname()
+                
+                hard_maj <- col_logit(xvarsi, dt)
+                
+                ############################ HARD outer validation ---------------------------
+                print("HARD model outer validation ------------------------------------------")
+                probs_hard_best <- predict(hard_best$model, dt_val, type = "response")
+                auroc_hard_best <- AUC(probs_hard_best, dt_val$DEFAULT_100_3M_1Y)
+                aucpr_hard_best <- PRAUC(probs_hard_best, dt_val$DEFAULT_100_3M_1Y)
+                
+                probs_hard_maj <- predict(hard_maj$model, dt_val, type = "response")
+                auroc_hard_maj <- AUC(probs_hard_maj, dt_val$DEFAULT_100_3M_1Y)
+                aucpr_hard_maj <- PRAUC(probs_hard_maj, dt_val$DEFAULT_100_3M_1Y)
+                
+                print(paste0("best AUPRC: ", round(aucpr_hard_best, 4)))
+                print(paste0("majority AUPRC: ", round(aucpr_hard_maj, 4)))
+                
+                ############################ HARD outer results ------------------------------
+                specs_hard <- data.frame(type_model = c("best", "majority"),
+                                         in_sample_auroc = c(hard_best$specs["auroc"],
+                                                             hard_maj$specs["auroc"]),
+                                         in_sample_aucpr = c(hard_best$specs["aucpr"],
+                                                             hard_maj$specs["aucpr"]),
+                                         outer_aucpr = c(aucpr_hard_best, aucpr_hard_maj),
+                                         outer_auroc = c(auroc_hard_best, auroc_hard_maj),
+                                         fold = X)
+                
+                res_hard <- list(outer_models = list(hard_best, hard_maj),
+                                 outer_predictions = list(probs_hard_best, probs_hard_maj),
+                                 specs = specs_hard)
+                
+                ############################ CART complexity ---------------------------------
+                resi_cart <- lapply(resi, FUN = function(x){x$cart$specs$aucpr})
+                resi_cart <- Reduce(cbind, resi_cart)
+                resi_cart_sum <- apply(resi_cart, 1, FUN = function(x){
+                  mi <- min(x)
+                  ma <- max(x)
+                  mn <- mean(x)
+                  se <- sd(x) / sqrt(5)
+                  temp <- data.frame(min = mi, max = ma, aucpr = mn, se = se)
+                  return(temp)
+                })
+                resi_cart_sum <- Reduce(rbind, resi_cart_sum)
+                resi_cart_sum <- cbind(cp_grid, resi_cart_sum)
+                # cp max
+                cpmax_n <- which.max(resi_cart_sum$aucpr)
+                cpmax <- resi_cart_sum$cp_grid[cpmax_n]
+                # se of max lambda
+                se_cpmax <- resi_cart_sum$se[cpmax_n]
+                # aucpr of max lambda
+                auc_cpmax <- resi_cart_sum$aucpr[cpmax_n]
+                # lambda 1se
+                cp1se <- max(resi_cart_sum$cp_grid[resi_cart_sum$aucpr > auc_cpmax - se_cpmax])
+                cp1se_n <- which(resi_cart_sum$cp_grid == cp1se)
+                # aucpr of 1se lambda
+                auc_cp1se <- resi_cart_sum$aucpr[cp1se_n]
+                
+                print("CART model hyperparameters -------------------------------------------")
+                print(paste0("CP max: ", round(cpmax, 4), " AUPRC: ", round(auc_cpmax, 4)))
+                print(paste0("CP 1se: ", round(cp1se, 4), " AUPRC: ", round(auc_cp1se, 4)))
+                
+                ############################ CART outer estimation ---------------------------
+                # fit model with cp max and cp 1se
+                print("CART model outer evaluation ------------------------------------------")
+                tree_control = c(minsplit = 2, minbucket = 1, cp = 0, xval = 0)
+                set.seed(12345)
+                mdl_tree <- rpart(DEFAULT_100_3M_1Y ~., data = dt, method = "class",
+                                  control = tree_control)
+                mdl_tree_max <- prune(mdl_tree, cp = cpmax)
+                mdl_tree_1se <- prune(mdl_tree, cp = cp1se)
+                
+                # in-sample performance
+                probs_cart_inmax <- rpart.predict(mdl_tree_max, newdata = dt, type = "prob")
+                probs_cart_inmax <- probs_cart_inmax[, 2]
+                
+                probs_cart_in1se <- rpart.predict(mdl_tree_1se, newdata = dt, type = "prob")
+                probs_cart_in1se <- probs_cart_in1se[, 2]
+                
+                auroc_cart_in <- c(AUC(probs_cart_inmax, y_true = dt$DEFAULT_100_3M_1Y),
+                                   AUC(probs_cart_in1se, y_true = dt$DEFAULT_100_3M_1Y))
+                aucpr_cart_in <- c(PRAUC(probs_cart_inmax, y_true = dt$DEFAULT_100_3M_1Y),
+                                   PRAUC(probs_cart_in1se, y_true = dt$DEFAULT_100_3M_1Y))
+                
+                ############################ CART outer validation ---------------------------
+                # test model with cp max and cp 1se
+                print("CART model outer validation ------------------------------------------")
+                probs_cart_max <- rpart.predict(mdl_tree_max, newdata = dt_val, type = "prob")
+                probs_cart_max <- probs_cart_max[, 2]
+                
+                probs_cart_1se <- rpart.predict(mdl_tree_1se, newdata = dt_val, type = "prob")
+                probs_cart_1se <- probs_cart_1se[, 2]
+                
+                auroc_cart <- c(AUC(probs_cart_max, y_true = dt_val$DEFAULT_100_3M_1Y),
+                                AUC(probs_cart_1se, y_true = dt_val$DEFAULT_100_3M_1Y))
+                aucpr_cart <- c(PRAUC(probs_cart_max, y_true = dt_val$DEFAULT_100_3M_1Y),
+                                PRAUC(probs_cart_1se, y_true = dt_val$DEFAULT_100_3M_1Y))
+                
+                print(paste0("CP max AUPRC: ", round(aucpr_cart[1], 4)))
+                print(paste0("CP 1se AUPRC: ", round(aucpr_cart[2], 4)))
+                
+                ############################ CART outer results ------------------------------
+                specs_cart <- data.frame(cp = c(cpmax, cp1se),
+                                         nsplit = c(tail(mdl_tree_max$cptable, 1)[2],
+                                                    tail(mdl_tree_1se$cptable, 1)[2]),
+                                         in_sample_auroc = auroc_cart_in,
+                                         in_sample_aucpr = aucpr_cart_in,
+                                         outer_aucpr = auroc_cart,
+                                         outer_auroc = aucpr_cart,
+                                         fold = X)
+                
+                res_cart <- list(outer_models = list(mdl_tree_max, mdl_tree_1se),
+                                 outer_predictions = list(probs_cart_max, probs_cart_1se),
+                                 specs = specs_cart)
+                
+                ############################ save results ------------------------------------
+                res_fold <- list(res_soft = res_soft, res_hard = res_hard, res_cart = res_cart,
+                                 data = list(dt, dt_val),
+                                 inner = resi)
+                return(res_fold)
+              })
+## ------------------ END OF CASE CONTROL CROSS VALIDATION ---------------------
